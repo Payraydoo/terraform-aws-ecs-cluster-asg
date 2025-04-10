@@ -17,10 +17,10 @@ This module creates an Amazon ECS cluster with an Auto Scaling Group (ASG) for E
 
 ```hcl
 module "ecs_cluster_asg" {
-  source  = "your-org/aws-ecs-cluster-asg/terraform"
+  source  = "payraydoo/aws-ecs-cluster-asg/terraform"
   version = "0.1.0"
 
-  tag_org        = "company"
+  tag_org        = "payraydoo"
   env            = "dev"
   cluster_name   = "app-cluster"
   
@@ -31,13 +31,13 @@ module "ecs_cluster_asg" {
   instance_type        = "t3.medium"
   min_size             = 1
   max_size             = 5
-  desired_capacity     = 2
+  desired_capacity     = 1
   
   # Scaling
   target_capacity      = 80
   
   tags = {
-    Project     = "my-project"
+    Project     = "payraydoo"
     ManagedBy   = "terraform"
   }
 }
