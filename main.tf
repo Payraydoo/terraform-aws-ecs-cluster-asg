@@ -1,57 +1,95 @@
-/**
- * # AWS ECS Cluster with Auto Scaling Group
- *
- * This Terraform module creates an ECS cluster with an auto-scaling group of EC2 instances
- * that automatically register with the cluster. The ASG scales based on CPU or Memory reservation.
- */
+##############################################
+# main.tf
+##############################################
 
-terraform {
-  required_version = ">= 1.0.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 4.0.0"
-    }
+# Create ECS cluster
+resource "aws_ecs_cluster" "this" {
+  name = "${var.tag_org}-${var.env}-${var.cluster_name}"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
   }
-}
 
-#--------------------------
-# Locals
-#--------------------------
-
-locals {
-  # Generate standard tags for resources
   tags = merge(
     {
-      Name         = "${var.tag_org_short_name}-${var.environment}-ecs-cluster"
-      Environment  = var.environment
+      Name        = "${var.tag_org}-${var.env}-${var.cluster_name}"
+      Environment = var.env
       Organization = var.tag_org
     },
     var.tags
   )
-  
-  # Resource-specific names
-  security_group_name = "${var.tag_org_short_name}-${var.environment}-ecs-sg"
-  iam_role_name       = "${var.tag_org_short_name}-${var.environment}-ecs-role"
-  instance_name       = "${var.tag_org_short_name}-${var.environment}-ecs-instance"
-  asg_name            = "${var.tag_org_short_name}-${var.environment}-ecs-asg"
-  capacity_provider_name = "${var.tag_org_short_name}-${var.environment}-ecs-cp"
-  
-  # Scaling metric name
-  metric_name = var.scaling_metric == "cpu" ? "CPUReservation" : "MemoryReservation"
 }
 
-#--------------------------
-# Data Sources
-#--------------------------
+# Create IAM role for ECS instances
+resource "aws_iam_role" "ecs_instance_role" {
+  name = "${var.tag_org}-${var.env}-${var.cluster_name}-instance-role"
 
-data "aws_region" "current" {}
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      },
+    ]
+  })
 
-data "aws_caller_identity" "current" {}
+  tags = merge(
+    {
+      Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-instance-role"
+      Environment = var.env
+      Organization = var.tag_org
+    },
+    var.tags
+  )
+}
 
-# Get the latest ECS-optimized AMI if none is specified
+# Attach policies to the ECS instance role
+resource "aws_iam_role_policy_attachment" "ecs_instance_role_policy" {
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_instance_ssm_policy" {
+  role       = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# Create IAM instance profile
+resource "aws_iam_instance_profile" "ecs_instance_profile" {
+  name = "${var.tag_org}-${var.env}-${var.cluster_name}-instance-profile"
+  role = aws_iam_role.ecs_instance_role.name
+}
+
+# Create security group for ECS instances
+resource "aws_security_group" "ecs_instances" {
+  name        = "${var.tag_org}-${var.env}-${var.cluster_name}-sg"
+  description = "Security group for ECS instances in cluster ${var.cluster_name}"
+  vpc_id      = var.vpc_id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(
+    {
+      Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-sg"
+      Environment = var.env
+      Organization = var.tag_org
+    },
+    var.tags
+  )
+}
+
+# Get latest ECS-optimized AMI
 data "aws_ami" "ecs_optimized" {
-  count       = var.ami_id == "" ? 1 : 0
   most_recent = true
   owners      = ["amazon"]
 
@@ -66,211 +104,140 @@ data "aws_ami" "ecs_optimized" {
   }
 }
 
-#--------------------------
-# ECS Cluster
-#--------------------------
-
-resource "aws_ecs_cluster" "this" {
-  name = var.name
-  
-  setting {
-    name  = "containerInsights"
-    value = "enabled"
-  }
-  
-  tags = local.tags
+# Create user data for ECS instances
+locals {
+  user_data = var.user_data != "" ? var.user_data : <<-EOF
+    #!/bin/bash
+    echo ECS_CLUSTER=${aws_ecs_cluster.this.name} >> /etc/ecs/ecs.config
+    echo ECS_ENABLE_SPOT_INSTANCE_DRAINING=true >> /etc/ecs/ecs.config
+    echo ECS_ENABLE_CONTAINER_METADATA=true >> /etc/ecs/ecs.config
+    echo ECS_AVAILABLE_LOGGING_DRIVERS='["json-file","awslogs"]' >> /etc/ecs/ecs.config
+    yum update -y
+    yum install -y amazon-cloudwatch-agent
+    systemctl enable amazon-cloudwatch-agent
+    systemctl start amazon-cloudwatch-agent
+  EOF
 }
 
-# Capacity provider for the cluster (connects ASG to ECS cluster)
-resource "aws_ecs_capacity_provider" "this" {
-  count = var.capacity_provider_enabled ? 1 : 0
-  
-  name = local.capacity_provider_name
-  
-  auto_scaling_group_provider {
-    auto_scaling_group_arn         = aws_autoscaling_group.this.arn
-    managed_termination_protection = "DISABLED"
-    
-    managed_scaling {
-      maximum_scaling_step_size = 10
-      minimum_scaling_step_size = 1
-      status                    = "ENABLED"
-      target_capacity           = var.scaling_threshold
-    }
-  }
-  
-  tags = merge(
-    local.tags,
-    {
-      Name = local.capacity_provider_name
-    }
-  )
-}
-
-resource "aws_ecs_cluster_capacity_providers" "this" {
-  count = var.capacity_provider_enabled ? 1 : 0
-  
-  cluster_name = aws_ecs_cluster.this.name
-  
-  capacity_providers = [
-    aws_ecs_capacity_provider.this[0].name
-  ]
-  
-  default_capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.this[0].name
-    weight            = 100
-    base              = 1
-  }
-}
-
-#--------------------------
-# IAM Roles and Policies
-#--------------------------
-
-resource "aws_iam_role" "ecs_instance_role" {
-  count = var.instance_profile_name == null ? 1 : 0
-  
-  name = local.iam_role_name
-  
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-  
-  tags = local.tags
-}
-
-resource "aws_iam_role_policy_attachment" "ecs_instance_role" {
-  count = var.instance_profile_name == null ? 1 : 0
-  
-  role       = aws_iam_role.ecs_instance_role[0].name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
-}
-
-resource "aws_iam_role_policy_attachment" "ecs_instance_ssm" {
-  count = var.instance_profile_name == null ? 1 : 0
-  
-  role       = aws_iam_role.ecs_instance_role[0].name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-}
-
-resource "aws_iam_instance_profile" "ecs_instance_profile" {
-  count = var.instance_profile_name == null ? 1 : 0
-  
-  name = "${var.tag_org_short_name}-${var.environment}-ecs-instance-profile"
-  role = aws_iam_role.ecs_instance_role[0].name
-}
-
-#--------------------------
-# Security Group
-#--------------------------
-
-resource "aws_security_group" "ecs_instance_sg" {
-  name        = local.security_group_name
-  description = "Security group for ECS instances in ${var.name} cluster"
-  vpc_id      = var.vpc_id
-  
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-  
-  tags = local.tags
-}
-
-#--------------------------
-# Auto Scaling Group
-#--------------------------
-
+# Create launch template for ASG
 resource "aws_launch_template" "this" {
-  name_prefix            = "${var.tag_org_short_name}-${var.environment}-ecs-"
-  image_id               = var.ami_id != "" ? var.ami_id : data.aws_ami.ecs_optimized[0].id
-  instance_type          = var.instance_type
-  key_name               = var.key_name
-  ebs_optimized          = var.ebs_optimized
-  vpc_security_group_ids = concat([aws_security_group.ecs_instance_sg.id], var.additional_security_group_ids)
+  name_prefix   = "${var.tag_org}-${var.env}-${var.cluster_name}-"
+  image_id      = data.aws_ami.ecs_optimized.id
+  instance_type = var.instance_type
   
+  # User data
+  user_data = base64encode(local.user_data)
+  
+  # IAM instance profile
   iam_instance_profile {
-    name = var.instance_profile_name != null ? var.instance_profile_name : aws_iam_instance_profile.ecs_instance_profile[0].name
+    name = aws_iam_instance_profile.ecs_instance_profile.name
   }
   
-  monitoring {
-    enabled = var.enable_monitoring
+  # Network
+  network_interfaces {
+    associate_public_ip_address = var.associate_public_ip
+    security_groups             = concat([aws_security_group.ecs_instances.id], var.security_group_ids)
+    delete_on_termination       = true
   }
   
+  # Storage
   block_device_mappings {
     device_name = "/dev/xvda"
     
     ebs {
-      volume_size           = var.root_volume_size
-      volume_type           = var.root_volume_type
+      volume_size           = var.ebs_volume_size
+      volume_type           = var.ebs_volume_type
       delete_on_termination = true
       encrypted             = true
     }
   }
   
-  user_data = base64encode(<<-EOF
-    #!/bin/bash
-    echo "ECS_CLUSTER=${aws_ecs_cluster.this.name}" >> /etc/ecs/ecs.config
-    echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
-    echo "ECS_AVAILABLE_LOGGING_DRIVERS=[\"json-file\",\"awslogs\"]" >> /etc/ecs/ecs.config
-    ${var.user_data_extra}
-  EOF
-  )
+  # Metadata options
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required" # IMDSv2 required for security
+    http_put_response_hop_limit = 1
+  }
   
+  # Monitoring
+  monitoring {
+    enabled = true
+  }
+  
+  # Tagging
   tag_specifications {
     resource_type = "instance"
-    tags = local.tags
+    
+    tags = merge(
+      {
+        Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-instance"
+        Environment = var.env
+        Organization = var.tag_org
+      },
+      var.tags
+    )
   }
   
   tag_specifications {
     resource_type = "volume"
-    tags = local.tags
+    
+    tags = merge(
+      {
+        Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-volume"
+        Environment = var.env
+        Organization = var.tag_org
+      },
+      var.tags
+    )
   }
   
-  lifecycle {
-    create_before_destroy = true
-  }
+  tags = merge(
+    {
+      Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-launch-template"
+      Environment = var.env
+      Organization = var.tag_org
+    },
+    var.tags
+  )
 }
 
+# Create Auto Scaling Group
 resource "aws_autoscaling_group" "this" {
-  name                      = local.asg_name
-  min_size                  = var.min_size
-  max_size                  = var.max_size
-  desired_capacity          = var.desired_capacity
-  vpc_zone_identifier       = var.subnet_ids
-  health_check_grace_period = var.health_check_grace_period
-  health_check_type         = var.health_check_type
-  termination_policies      = var.termination_policies
+  name                = "${var.tag_org}-${var.env}-${var.cluster_name}-asg"
+  vpc_zone_identifier = var.private_subnet_ids
+  min_size            = var.min_size
+  max_size            = var.max_size
+  desired_capacity    = var.desired_capacity
   
+  # Launch template
   launch_template {
     id      = aws_launch_template.this.id
     version = "$Latest"
   }
   
-  instance_refresh {
-    strategy = "Rolling"
-    preferences {
-      min_healthy_percentage = 50
-    }
-  }
+  # Health check
+  health_check_type          = "EC2"
+  health_check_grace_period  = 300
   
+  # Termination policies
+  termination_policies       = ["OldestInstance", "Default"]
+  
+  # Wait for instances to be healthy on scale out
+  wait_for_capacity_timeout  = "10m"
+  
+  # Instance protection
+  protect_from_scale_in      = false
+  
+  # Tags for ASG
   dynamic "tag" {
     for_each = merge(
-      local.tags,
       {
+        Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-instance"
+        Environment = var.env
+        Organization = var.tag_org
         AmazonECSManaged = ""
-      }
+      },
+      var.tags
     )
     
     content {
@@ -285,60 +252,59 @@ resource "aws_autoscaling_group" "this" {
   }
 }
 
-#--------------------------
-# CloudWatch Alarms and Auto Scaling Policies
-#--------------------------
+# Create ECS capacity provider
+resource "aws_ecs_capacity_provider" "this" {
+  name = "${var.tag_org}-${var.env}-${var.cluster_name}-cp"
 
-resource "aws_cloudwatch_metric_alarm" "high_reservation" {
-  alarm_name          = "${var.tag_org_short_name}-${var.environment}-high-${var.scaling_metric}-reservation"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = local.metric_name
-  namespace           = "AWS/ECS"
-  period              = 60
-  statistic           = "Average"
-  threshold           = var.scaling_threshold
-  alarm_description   = "This metric monitors ECS cluster ${var.scaling_metric} reservation"
-  
-  dimensions = {
-    ClusterName = aws_ecs_cluster.this.name
+  auto_scaling_group_provider {
+    auto_scaling_group_arn         = aws_autoscaling_group.this.arn
+    managed_termination_protection = "DISABLED"
+
+    managed_scaling {
+      maximum_scaling_step_size = 10
+      minimum_scaling_step_size = 1
+      status                    = "ENABLED"
+      target_capacity           = var.target_capacity
+    }
   }
-  
-  alarm_actions = [aws_autoscaling_policy.scale_up.arn]
+
+  tags = merge(
+    {
+      Name        = "${var.tag_org}-${var.env}-${var.cluster_name}-cp"
+      Environment = var.env
+      Organization = var.tag_org
+    },
+    var.tags
+  )
 }
 
-resource "aws_cloudwatch_metric_alarm" "low_reservation" {
-  alarm_name          = "${var.tag_org_short_name}-${var.environment}-low-${var.scaling_metric}-reservation"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = local.metric_name
-  namespace           = "AWS/ECS"
-  period              = 60
-  statistic           = "Average"
-  threshold           = var.scaling_threshold / 2  # Scale down at 50% of the scale up threshold
-  alarm_description   = "This metric monitors ECS cluster ${var.scaling_metric} reservation"
-  
-  dimensions = {
-    ClusterName = aws_ecs_cluster.this.name
+# Attach capacity provider to cluster
+resource "aws_ecs_cluster_capacity_providers" "this" {
+  cluster_name       = aws_ecs_cluster.this.name
+  capacity_providers = [aws_ecs_capacity_provider.this.name]
+
+  default_capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.this.name
+    weight            = 1
+    base              = 0
   }
-  
-  alarm_actions = [aws_autoscaling_policy.scale_down.arn]
 }
 
+# Create scaling policies based on ECS service utilization
 resource "aws_autoscaling_policy" "scale_up" {
-  name                   = "${var.tag_org_short_name}-${var.environment}-scale-up"
+  name                   = "${var.tag_org}-${var.env}-${var.cluster_name}-scale-up"
   autoscaling_group_name = aws_autoscaling_group.this.name
   adjustment_type        = "ChangeInCapacity"
   scaling_adjustment     = 1
-  cooldown               = var.scale_up_cooldown
+  cooldown               = 300
   policy_type            = "SimpleScaling"
 }
 
 resource "aws_autoscaling_policy" "scale_down" {
-  name                   = "${var.tag_org_short_name}-${var.environment}-scale-down"
+  name                   = "${var.tag_org}-${var.env}-${var.cluster_name}-scale-down"
   autoscaling_group_name = aws_autoscaling_group.this.name
   adjustment_type        = "ChangeInCapacity"
   scaling_adjustment     = -1
-  cooldown               = var.scale_down_cooldown
+  cooldown               = 300
   policy_type            = "SimpleScaling"
 }
