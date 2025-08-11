@@ -95,7 +95,7 @@ data "aws_ami" "ecs_optimized" {
 
   filter {
     name   = "name"
-    values = ["amzn2-ami-ecs-hvm-*-x86_64-ebs"]
+    values = ["al2023-ami-ecs-hvm-*-x86_64"]
   }
 
   filter {
@@ -111,9 +111,11 @@ locals {
     echo ECS_CLUSTER=${aws_ecs_cluster.this.name} >> /etc/ecs/ecs.config
     echo ECS_ENABLE_SPOT_INSTANCE_DRAINING=true >> /etc/ecs/ecs.config
     echo ECS_ENABLE_CONTAINER_METADATA=true >> /etc/ecs/ecs.config
+    echo ECS_ENABLE_TASK_IAM_ROLE=true >> /etc/ecs/ecs.config
+    echo ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true >> /etc/ecs/ecs.config
     echo ECS_AVAILABLE_LOGGING_DRIVERS='["json-file","awslogs"]' >> /etc/ecs/ecs.config
-    yum update -y
-    yum install -y amazon-cloudwatch-agent
+    dnf update -y
+    dnf install -y amazon-cloudwatch-agent
     systemctl enable amazon-cloudwatch-agent
     systemctl start amazon-cloudwatch-agent
   EOF
